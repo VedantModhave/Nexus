@@ -40,8 +40,8 @@ NUM_WORKERS = 4
 # ──────────────────────────────────────────────
 #  Training Hyperparameters
 # ──────────────────────────────────────────────
-NUM_EPOCHS_CLASSIFIER   = 30
-NUM_EPOCHS_SEGMENTATION = 50
+NUM_EPOCHS_CLASSIFIER   = 50
+NUM_EPOCHS_SEGMENTATION = 100
 LEARNING_RATE           = 1e-4
 
 # ──────────────────────────────────────────────

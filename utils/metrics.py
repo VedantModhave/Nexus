@@ -227,6 +227,140 @@ class CombinedLoss(nn.Module):
         return self.dice_weight * d_loss + self.bce_weight * b_loss
 
 
+class TverskyLoss(nn.Module):
+    """
+    Tversky loss — generalisation of Dice that allows asymmetric
+    penalisation of false positives vs false negatives.
+
+    With ``alpha=0.3, beta=0.7`` false negatives are penalised more
+    heavily, which is useful for small hemorrhage regions.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.3,
+        beta: float = 0.7,
+        smooth: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        pred = torch.sigmoid(pred_logits).contiguous().view(-1)
+        target = target.float().contiguous().view(-1)
+
+        tp = (pred * target).sum()
+        fp = (pred * (1 - target)).sum()
+        fn = ((1 - pred) * target).sum()
+
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        return 1.0 - tversky
+
+
+class TripleLoss(nn.Module):
+    """
+    Weighted sum of DiceLoss + BCEWithLogitsLoss + TverskyLoss.
+
+    Default: ``0.4 * Dice + 0.3 * BCE + 0.3 * Tversky``
+    """
+
+    def __init__(
+        self,
+        dice_weight: float = 0.4,
+        bce_weight: float = 0.3,
+        tversky_weight: float = 0.3,
+        tversky_alpha: float = 0.3,
+        tversky_beta: float = 0.7,
+        smooth: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+        self.tversky_weight = tversky_weight
+        self.dice_loss = DiceLoss(smooth=smooth)
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.tversky_loss = TverskyLoss(
+            alpha=tversky_alpha, beta=tversky_beta, smooth=smooth,
+        )
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        d = self.dice_loss(pred_logits, target)
+        b = self.bce_loss(pred_logits, target.float())
+        t = self.tversky_loss(pred_logits, target)
+        return self.dice_weight * d + self.bce_weight * b + self.tversky_weight * t
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for classification — down-weights easy examples so the
+    model focuses on hard, misclassified ones.
+
+    Supports label smoothing.  Works with logits (softmax applied internally).
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+        label_smoothing: float = 0.0,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self.num_classes = num_classes
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            logits:  (B, C) raw logits.
+            targets: (B,) integer class labels.
+        """
+        probs = F.softmax(logits, dim=1)
+
+        # One-hot with optional label smoothing
+        targets_one_hot = F.one_hot(targets, self.num_classes).float()
+        if self.label_smoothing > 0:
+            targets_one_hot = (
+                targets_one_hot * (1 - self.label_smoothing)
+                + self.label_smoothing / self.num_classes
+            )
+
+        # Focal modulating factor
+        pt = (probs * targets_one_hot).sum(dim=1)
+        focal_weight = (1.0 - pt) ** self.gamma
+
+        # Alpha weighting
+        alpha_t = torch.where(
+            targets == 1,
+            torch.tensor(self.alpha, device=logits.device),
+            torch.tensor(1.0 - self.alpha, device=logits.device),
+        )
+
+        # CE loss per sample
+        ce_loss = F.cross_entropy(logits, targets, reduction="none")
+
+        loss = alpha_t * focal_weight * ce_loss
+        return loss.mean()
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Self-test
 # ══════════════════════════════════════════════════════════════════════

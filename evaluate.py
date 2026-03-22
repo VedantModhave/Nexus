@@ -45,6 +45,7 @@ from utils.metrics import (
     dice_coefficient,
     iou_score,
 )
+from sklearn.metrics import f1_score as sklearn_f1_score
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -86,6 +87,40 @@ def _build_cls_val_loader(batch_size: int) -> DataLoader:
     )
 
 
+def find_optimal_threshold(
+    y_true: List[int],
+    y_probs: List[float],
+    low: float = 0.30,
+    high: float = 0.70,
+    step: float = 0.01,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Sweep thresholds from *low* to *high* in *step* increments and pick
+    the one that maximises F1 score.
+
+    Returns:
+        ``(best_threshold, {threshold: f1, ...})``
+    """
+    y_true_np = np.asarray(y_true)
+    y_probs_np = np.asarray(y_probs)
+
+    results: Dict[str, float] = {}
+    best_thr = 0.5
+    best_f1 = 0.0
+
+    thr = low
+    while thr <= high + 1e-9:
+        y_pred = (y_probs_np >= thr).astype(int)
+        f1 = float(sklearn_f1_score(y_true_np, y_pred, zero_division=0))
+        results[f"{thr:.2f}"] = f1
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = round(thr, 2)
+        thr = round(thr + step, 4)
+
+    return best_thr, results
+
+
 def evaluate_classifier(
     model_path: str,
     val_loader: DataLoader,
@@ -125,8 +160,19 @@ def evaluate_classifier(
             all_labels.extend(labels.numpy().tolist())
             all_probs.extend(probs.cpu().numpy().tolist())
 
-    # ── compute metrics ───────────────────────────────────────────────
-    metrics = compute_classification_metrics(all_labels, all_probs)
+    # ── find optimal threshold ────────────────────────────────────────
+    optimal_thr, thr_results = find_optimal_threshold(all_labels, all_probs)
+    print(f"\n  ── Optimal Threshold Search (0.30–0.70, step=0.01) ──")
+    print(f"  Optimal threshold : {optimal_thr:.2f}")
+    # Show top-5 thresholds
+    sorted_thrs = sorted(thr_results.items(), key=lambda x: x[1], reverse=True)[:5]
+    for thr_str, f1_val in sorted_thrs:
+        marker = " ◀ BEST" if thr_str == f"{optimal_thr:.2f}" else ""
+        print(f"    threshold={thr_str}  →  F1={f1_val:.4f}{marker}")
+
+    # ── compute metrics at optimal threshold ──────────────────────────
+    metrics = compute_classification_metrics(all_labels, all_probs, threshold=optimal_thr)
+    print(f"\n  ── Metrics at optimal threshold ({optimal_thr:.2f}) ──")
 
     print(f"\n  Accuracy  : {metrics['accuracy']:.4f}")
     print(f"  F1 Score  : {metrics['f1_score']:.4f}")
@@ -181,7 +227,7 @@ def evaluate_classifier(
 
     # Build a numeric matrix from precision / recall / f1 per class
     from sklearn.metrics import precision_recall_fscore_support
-    y_pred = (np.asarray(all_probs) >= 0.5).astype(int)
+    y_pred = (np.asarray(all_probs) >= optimal_thr).astype(int)
     prec, rec, f1, sup = precision_recall_fscore_support(
         all_labels, y_pred, labels=[0, 1], zero_division=0,
     )
@@ -246,12 +292,18 @@ def evaluate_segmentation(
     print("=" * 64)
 
     # ── load model ────────────────────────────────────────────────────
-    model = get_segmentation_model(model_type=model_type)
     ckpt = torch.load(model_path, map_location=device)
+    ckpt_model_type = ckpt.get("model_type", model_type)
+    ckpt_encoder = ckpt.get("encoder", "resnet34")
+    model = get_segmentation_model(
+        model_type=ckpt_model_type,
+        encoder_name=ckpt_encoder,
+    )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
     print(f"  Loaded checkpoint: {model_path}  (epoch {ckpt.get('epoch', '?')})")
+    print(f"  Encoder: {ckpt_encoder}, Architecture: {ckpt_model_type}")
 
     # ── inference + metrics ───────────────────────────────────────────
     dice_scores: List[float] = []

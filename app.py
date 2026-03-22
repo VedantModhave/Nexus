@@ -158,7 +158,11 @@ def load_models():
         try:
             ckpt = torch.load(seg_path, map_location=device)
             model_type = ckpt.get("model_type", "unet")
-            segmentor = get_segmentation_model(model_type=model_type)
+            encoder_name = ckpt.get("encoder", "resnet34")
+            segmentor = get_segmentation_model(
+                model_type=model_type,
+                encoder_name=encoder_name,
+            )
             segmentor.load_state_dict(ckpt["model_state_dict"])
             segmentor.to(device)
             segmentor.eval()
@@ -209,7 +213,12 @@ def run_classification(
         logits = model(tensor)
         proba = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
-    pred_idx   = int(np.argmax(proba))
+    # Use 0.36 threshold (F1-optimised) instead of argmax
+    stroke_prob = proba[1]
+    if stroke_prob >= 0.36:
+        pred_idx = 1
+    else:
+        pred_idx = 0
     pred_class = config.CLASS_NAMES[pred_idx]
     confidence = float(proba[pred_idx])
     return pred_class, confidence, proba
@@ -218,15 +227,15 @@ def run_classification(
 def run_segmentation(
     model: torch.nn.Module,
     tensor: torch.Tensor,
-    threshold: float = 0.5,
+    threshold: float = 0.3,
 ) -> np.ndarray:
     """
     Returns binary mask as numpy array of shape (H, W) with values 0/1.
     """
     with torch.no_grad():
         logits = model(tensor)
-        mask = (torch.sigmoid(logits) >= threshold).float()
-        mask = mask.cpu().numpy()[0, 0]  # (H, W)
+        sig_out = torch.sigmoid(logits).cpu().numpy()[0, 0]
+        mask = (sig_out >= threshold).astype(np.float32)
     return mask
 
 
@@ -385,9 +394,10 @@ def main():
         # Controls
         threshold = st.slider(
             "Confidence Threshold",
-            min_value=0.3, max_value=0.9, value=0.5, step=0.05,
+            min_value=0.3, max_value=0.9, value=0.36, step=0.01,
             help="Minimum classification confidence to trigger segmentation.",
         )
+        st.caption("Optimal threshold (0.36) determined by F1 maximisation on validation set.")
         show_overlay = st.toggle("Show Segmentation Overlay", value=True)
         overlay_color = st.color_picker("Overlay Colour", value="#FF0000")
 
@@ -517,7 +527,7 @@ def main():
         else:
             with st.spinner("Running segmentation..."):
                 seg_tensor = preprocess_image(image_np, task="segmentation")
-                mask_np = run_segmentation(segmentor, seg_tensor, threshold=0.5)
+                mask_np = run_segmentation(segmentor, seg_tensor, threshold=0.3)
                 lesion_pct = compute_lesion_area_pct(mask_np)
 
                 # Resize mask back to original image dimensions

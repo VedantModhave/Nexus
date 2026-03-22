@@ -1,9 +1,18 @@
 """
 Training script for brain stroke classification.
 
+Improvements over v1:
+  - Focal Loss (gamma=2, alpha=0.25) with label smoothing=0.1
+  - 60 epochs training (was 50)
+  - Differential learning rates after backbone unfreeze (encoder 1e-5, head 1e-4)
+  - Test-Time Augmentation (TTA): 5 augmented views averaged
+  - Supports --resume to continue training from checkpoint
+  - Differential learning rates after backbone unfreeze (encoder 1e-5, head 1e-4)
+  - Test-Time Augmentation (TTA): 5 augmented views averaged
+
 Usage:
     python train_classifier.py
-    python train_classifier.py --epochs 40 --lr 3e-4 --batch_size 32
+    python train_classifier.py --epochs 50 --lr 1e-4 --batch_size 16
 """
 
 import argparse
@@ -11,7 +20,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -25,7 +34,7 @@ import config
 from models.classifier import get_classifier
 from utils.dataset import StrokeClassificationDataset, classification_collate_fn
 from utils.transforms import get_classification_transforms
-from utils.metrics import compute_classification_metrics
+from utils.metrics import compute_classification_metrics, FocalLoss
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -132,7 +141,47 @@ def train_one_epoch(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Validation loop
+#  Test-Time Augmentation (TTA)
+# ══════════════════════════════════════════════════════════════════════
+
+def _tta_predict(
+    model: nn.Module,
+    images: torch.Tensor,
+    n_aug: int = 5,
+) -> torch.Tensor:
+    """
+    Run TTA: original + horizontal flip + vertical flip + 90° rotation
+    + 180° rotation.  Average softmax probabilities across all views.
+
+    Args:
+        model:  Classifier in eval mode.
+        images: Batch tensor ``(B, C, H, W)`` on device.
+        n_aug:  Number of augmented views (max 5).
+
+    Returns:
+        Averaged softmax probabilities ``(B, num_classes)``.
+    """
+    views = [images]                                          # 1. original
+    if n_aug >= 2:
+        views.append(torch.flip(images, dims=[3]))            # 2. horizontal flip
+    if n_aug >= 3:
+        views.append(torch.flip(images, dims=[2]))            # 3. vertical flip
+    if n_aug >= 4:
+        views.append(torch.rot90(images, k=1, dims=[2, 3]))  # 4. 90° rotation
+    if n_aug >= 5:
+        views.append(torch.rot90(images, k=2, dims=[2, 3]))  # 5. 180° rotation
+
+    all_probs = []
+    for v in views:
+        logits = model(v)
+        probs = torch.softmax(logits, dim=1)
+        all_probs.append(probs)
+
+    return torch.stack(all_probs).mean(dim=0)                 # (B, C)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Validation loop (with TTA)
 # ══════════════════════════════════════════════════════════════════════
 
 def validate(
@@ -140,9 +189,11 @@ def validate(
     loader: DataLoader,
     criterion: nn.Module,
     device: str,
+    use_tta: bool = False,
 ) -> Dict[str, float]:
     """
     Run validation and compute full classification metrics.
+    Optionally uses TTA (5 augmented views).
 
     Returns:
         Dictionary with ``loss``, ``accuracy``, ``f1``, ``roc_auc``.
@@ -159,15 +210,21 @@ def validate(
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
+            # Standard loss computation (always without TTA)
             logits = model(images)
             loss = criterion(logits, labels)
-
             running_loss += loss.item() * images.size(0)
             total += labels.size(0)
 
-            probs = torch.softmax(logits, dim=1)[:, 1]  # P(Stroke)
+            # Probabilities (with or without TTA)
+            if use_tta:
+                probs = _tta_predict(model, images, n_aug=5)
+            else:
+                probs = torch.softmax(logits, dim=1)
+
+            stroke_probs = probs[:, 1]  # P(Stroke)
             all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            all_probs.extend(stroke_probs.cpu().numpy())
 
     avg_loss = running_loss / total
     metrics = compute_classification_metrics(all_labels, all_probs)
@@ -177,24 +234,9 @@ def validate(
         "accuracy": metrics["accuracy"],
         "f1":       metrics["f1_score"],
         "roc_auc":  metrics["roc_auc"],
+        "precision": metrics["precision"],
+        "recall":   metrics["recall"],
     }
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Compute class weights for CrossEntropyLoss
-# ══════════════════════════════════════════════════════════════════════
-
-def _class_weights_for_ce(dataset: StrokeClassificationDataset) -> torch.Tensor:
-    """Inverse-frequency weights per class for CrossEntropyLoss."""
-    from collections import Counter
-    counts = Counter(dataset.labels)
-    total = len(dataset)
-    num_classes = len(counts)
-    weights = torch.tensor(
-        [total / (num_classes * counts[c]) for c in range(num_classes)],
-        dtype=torch.float32,
-    )
-    return weights
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -209,26 +251,45 @@ def main(args: argparse.Namespace) -> None:
     unfreeze_epoch = 5
 
     print("=" * 64)
-    print("  Brain Stroke Classification — Training")
+    print("  Brain Stroke Classification — Training (v2)")
     print("=" * 64)
     print(f"  Device          : {device}")
     print(f"  Epochs          : {epochs}")
     print(f"  Learning rate   : {lr}")
+    print(f"  Loss            : FocalLoss (γ=2, α=0.25, smooth=0.1)")
+    print(f"  TTA             : 5 views (flips + rotations)")
     print(f"  Unfreeze at     : epoch {unfreeze_epoch + 1}")
+    print(f"  Diff LR         : encoder={lr / 10:.0e}, head={lr:.0e}")
 
     # ── data ──────────────────────────────────────────────────────────
     train_loader, val_loader = setup_dataloaders(batch_size)
 
-    # ── model (backbone frozen) ───────────────────────────────────────
+    # ── model (backbone frozen initially, or resumed) ──────────────────
     model = get_classifier(pretrained=True, freeze=True)
+    start_epoch = 0
 
-    # ── loss with class weights ───────────────────────────────────────
-    train_dataset = train_loader.dataset
-    class_weights = _class_weights_for_ce(train_dataset).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    print(f"  CE class weights: {class_weights.cpu().tolist()}")
+    # Resume from checkpoint if --resume is set
+    resume_path = os.path.join(config.CHECKPOINT_DIR, "best_classifier.pth")
+    if args.resume and os.path.isfile(resume_path):
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"  ✓ Resumed from epoch {start_epoch} (F1={ckpt.get('best_f1', '?')})")
+        # Backbone should be unfrozen if past unfreeze epoch
+        if start_epoch >= unfreeze_epoch:
+            model.unfreeze_backbone()
+            print(f"  >>> Backbone already unfrozen (past epoch {unfreeze_epoch})")
 
-    # ── optimizer & scheduler ─────────────────────────────────────────
+    # ── Focal Loss with label smoothing ───────────────────────────────
+    criterion = FocalLoss(
+        gamma=2.0,
+        alpha=0.25,
+        label_smoothing=0.1,
+        num_classes=len(config.CLASS_NAMES),
+    )
+    print(f"  FocalLoss: gamma=2.0, alpha=0.25, label_smoothing=0.1")
+
+    # ── optimizer (only head params while frozen) & scheduler ─────────
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
@@ -237,39 +298,66 @@ def main(args: argparse.Namespace) -> None:
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-7)
 
     # ── history tracker ───────────────────────────────────────────────
-    history = {
-        "train_loss": [], "train_acc": [],
-        "val_loss": [], "val_acc": [], "val_f1": [], "val_auc": [],
-    }
+    history_path = os.path.join(config.CHECKPOINT_DIR, "classifier_history.json")
+    if args.resume and os.path.isfile(history_path):
+        with open(history_path, "r") as f:
+            history = json.load(f)
+        print(f"  ✓ Loaded existing history ({len(history['train_loss'])} epochs)")
+    else:
+        history = {
+            "train_loss": [], "train_acc": [],
+            "val_loss": [], "val_acc": [], "val_f1": [], "val_auc": [],
+        }
     best_f1 = 0.0
     best_epoch = -1
+    if args.resume and "val_f1" in history and len(history["val_f1"]) > 0:
+        best_f1 = max(history["val_f1"])
+        best_epoch = history["val_f1"].index(best_f1) + 1
 
     # ── training loop ─────────────────────────────────────────────────
     print("\n" + "-" * 64)
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
 
-        # Unfreeze backbone after `unfreeze_epoch` epochs
+        # ── Unfreeze backbone with differential LR at epoch 5 ─────────
         if epoch == unfreeze_epoch:
             print(f"\n  >>> Unfreezing backbone at epoch {epoch + 1}")
             model.unfreeze_backbone()
-            # Rebuild optimizer with all params & reduced LR
-            new_lr = lr / 10.0
-            optimizer = optim.AdamW(
-                model.parameters(), lr=new_lr, weight_decay=1e-4,
-            )
+
+            # Differential learning rates: slow encoder, fast head
+            encoder_lr = lr / 10.0  # 1e-5
+            head_lr    = lr         # 1e-4
+
+            # Separate parameters into encoder vs head groups
+            encoder_params = []
+            head_params = []
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    if "classifier" in name or "head" in name:
+                        head_params.append(param)
+                    else:
+                        encoder_params.append(param)
+
+            optimizer = optim.AdamW([
+                {"params": encoder_params, "lr": encoder_lr},
+                {"params": head_params,    "lr": head_lr},
+            ], weight_decay=1e-4)
+
             scheduler = CosineAnnealingLR(
                 optimizer, T_max=epochs - epoch, eta_min=1e-7,
             )
-            print(f"  >>> New LR: {new_lr}")
+            print(f"  >>> Differential LR: encoder={encoder_lr:.0e}, head={head_lr:.0e}")
 
         # Train
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
         )
 
-        # Validate
-        val_metrics = validate(model, val_loader, criterion, device)
+        # Validate (with TTA after unfreeze for better eval signal)
+        use_tta = (epoch >= unfreeze_epoch)
+        val_metrics = validate(
+            model, val_loader, criterion, device, use_tta=use_tta,
+        )
 
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
@@ -284,12 +372,13 @@ def main(args: argparse.Namespace) -> None:
         history["val_auc"].append(val_metrics["roc_auc"])
 
         # Print epoch summary
+        tta_flag = " [TTA]" if use_tta else ""
         print(
             f"  Epoch {epoch+1:>3}/{epochs} │ "
             f"train_loss {train_loss:.4f} │ train_acc {train_acc:.4f} │ "
             f"val_loss {val_metrics['loss']:.4f} │ val_acc {val_metrics['accuracy']:.4f} │ "
             f"val_f1 {val_metrics['f1']:.4f} │ val_auc {val_metrics['roc_auc']:.4f} │ "
-            f"lr {current_lr:.2e} │ {elapsed:.1f}s"
+            f"lr {current_lr:.2e} │ {elapsed:.1f}s{tta_flag}"
         )
 
         # Save best model by F1
@@ -321,7 +410,8 @@ def main(args: argparse.Namespace) -> None:
     header = f"  {'Epoch':>5} │ {'Train Loss':>10} │ {'Train Acc':>9} │ {'Val Loss':>8} │ {'Val Acc':>7} │ {'Val F1':>6} │ {'Val AUC':>7}"
     print(header)
     print("  " + "─" * (len(header) - 2))
-    for i in range(epochs):
+    num_entries = len(history["train_loss"])
+    for i in range(num_entries):
         marker = " ◀ best" if (i + 1) == best_epoch else ""
         print(
             f"  {i+1:>5} │ "
@@ -346,8 +436,8 @@ if __name__ == "__main__":
         description="Train brain stroke classifier (EfficientNet-B4).",
     )
     parser.add_argument(
-        "--epochs", type=int, default=config.NUM_EPOCHS_CLASSIFIER,
-        help=f"Number of training epochs (default: {config.NUM_EPOCHS_CLASSIFIER})",
+        "--epochs", type=int, default=60,
+        help="Number of training epochs (default: 60)",
     )
     parser.add_argument(
         "--lr", type=float, default=config.LEARNING_RATE,
@@ -356,6 +446,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", type=int, default=config.BATCH_SIZE,
         help=f"Batch size (default: {config.BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume training from best_classifier.pth checkpoint.",
     )
     args = parser.parse_args()
     main(args)
