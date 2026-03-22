@@ -1,0 +1,59 @@
+# ── Virtual environment ───────────────────────
+venv/
+env/
+.venv/
+
+# ── Python cache ──────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Distribution / packaging ─────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ── Model checkpoints & weights ──────────────
+checkpoints/
+saved_models/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+
+# ── Training outputs ─────────────────────────
+evaluate_outputs/
+*.json
+
+# ── Data (too large for git) ─────────────────
+data/
+
+# ── IDE / editor ─────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ── OS files ─────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ── Jupyter notebooks ────────────────────────
+.ipynb_checkpoints/
+
+# ── Logs ─────────────────────────────────────
+*.log
+logs/
+
+# ── Misc ─────────────────────────────────────
+.env
+*.bak
+*.tmp
